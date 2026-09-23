@@ -1,5 +1,7 @@
 import unittest
 from unittest import mock
+import sys
+import types
 
 from src.shared.openai_options import (
     OpenAICompatibleExecutionOptions,
@@ -7,8 +9,32 @@ from src.shared.openai_options import (
     OpenAICompatibleRequestOptions,
 )
 
+if "openai" not in sys.modules:
+    openai_stub = types.ModuleType("openai")
+
+    class _OpenAI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    class _AsyncOpenAI:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    openai_stub.OpenAI = _OpenAI
+    openai_stub.AsyncOpenAI = _AsyncOpenAI
+    sys.modules["openai"] = openai_stub
+
 
 class MangaInsightSharedTransportTests(unittest.IsolatedAsyncioTestCase):
+    def test_shared_json_parser_ignores_reasoning_tags_before_extracting_json(self) -> None:
+        from src.shared.openai_execution import parse_json_block_from_text
+
+        parsed = parse_json_block_from_text(
+            '<think>{"draft": 1}</think>\n```json\n{"answer": "ok"}\n```'
+        )
+
+        self.assertEqual(parsed, {"answer": "ok"})
+
     async def test_chat_client_reads_nested_openai_options_from_config(self) -> None:
         from src.core.manga_insight.config_models import ChatLLMConfig
         from src.core.manga_insight.embedding_client import ChatClient
@@ -73,6 +99,39 @@ class MangaInsightSharedTransportTests(unittest.IsolatedAsyncioTestCase):
             {"thinking": {"type": "disabled"}},
         )
 
+    async def test_chat_client_generate_json_retries_until_markdown_json_parses(self) -> None:
+        from src.core.manga_insight.config_models import ChatLLMConfig
+        from src.core.manga_insight.embedding_client import ChatClient
+
+        config = ChatLLMConfig.from_dict(
+            {
+                "provider": "custom",
+                "api_key": "test-key",
+                "model": "chat-model",
+                "base_url": "https://example.com/v1",
+                "openai_options": {
+                    "request": {"temperature": 0.4},
+                    "execution": {"use_stream": False, "business_retries": 1},
+                },
+            }
+        )
+
+        complete_mock = mock.AsyncMock(
+            side_effect=[
+                "这不是 JSON",
+                '```json\n{"answer": "retry-ok"}\n```',
+            ]
+        )
+        with mock.patch(
+            "src.core.manga_insight.embedding_client.AsyncOpenAICompatibleTransport.complete",
+            new=complete_mock,
+        ):
+            client = ChatClient(config)
+            parsed = await client.generate_json("用户问题")
+
+        self.assertEqual(parsed, {"answer": "retry-ok"})
+        self.assertEqual(complete_mock.await_count, 2)
+
     async def test_chat_client_delegates_to_shared_async_transport(self) -> None:
         from src.core.manga_insight.config_models import ChatLLMConfig
         from src.core.manga_insight.embedding_client import ChatClient
@@ -135,6 +194,83 @@ class MangaInsightSharedTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.base_url, "https://example.com/v1")
         self.assertEqual(request.inputs, ["第一页", "第二页"])
 
+    async def test_embedding_client_uses_configured_transport_retries_and_unlimited_timeout(self) -> None:
+        from src.core.manga_insight.config_models import EmbeddingConfig
+        from src.core.manga_insight.embedding_client import EmbeddingClient
+
+        config = EmbeddingConfig(
+            provider="custom",
+            api_key="test-key",
+            model="embedding-model",
+            base_url="https://example.com/v1",
+            rpm_limit=0,
+            transport_retries=10,
+            business_retries=10,
+            timeout_seconds=0,
+        )
+
+        with mock.patch(
+            "src.core.manga_insight.embedding_client.AsyncOpenAICompatibleTransport.embed",
+            new=mock.AsyncMock(return_value=[[0.1, 0.2]]),
+        ) as embed_mock:
+            client = EmbeddingClient(config)
+            await client.embed_batch(["第一页"])
+
+        self.assertEqual(client._transport.max_retries, 10)
+        request = embed_mock.call_args.args[0]
+        self.assertIsNone(request.timeout)
+
+    async def test_embedding_client_retries_empty_business_result(self) -> None:
+        from src.core.manga_insight.config_models import EmbeddingConfig
+        from src.core.manga_insight.embedding_client import EmbeddingClient
+
+        config = EmbeddingConfig(
+            provider="custom",
+            api_key="test-key",
+            model="embedding-model",
+            base_url="https://example.com/v1",
+            rpm_limit=0,
+            transport_retries=0,
+            business_retries=1,
+            timeout_seconds=0,
+        )
+
+        with mock.patch(
+            "src.core.manga_insight.embedding_client.AsyncOpenAICompatibleTransport.embed",
+            new=mock.AsyncMock(side_effect=[[], [[0.1, 0.2]]]),
+        ) as embed_mock:
+            client = EmbeddingClient(config)
+            embeddings = await client.embed_batch(["第一页"])
+
+        self.assertEqual(embeddings, [[0.1, 0.2]])
+        self.assertEqual(embed_mock.await_count, 2)
+
+    async def test_embedding_client_does_not_business_retry_generic_value_error(self) -> None:
+        from src.core.manga_insight.config_models import EmbeddingConfig
+        from src.core.manga_insight.embedding_client import EmbeddingClient
+
+        config = EmbeddingConfig(
+            provider="custom",
+            api_key="test-key",
+            model="embedding-model",
+            base_url="https://example.com/v1",
+            rpm_limit=0,
+            transport_retries=0,
+            business_retries=10,
+            timeout_seconds=0,
+        )
+
+        with mock.patch(
+            "src.core.manga_insight.embedding_client.AsyncOpenAICompatibleTransport.embed",
+            new=mock.AsyncMock(side_effect=ValueError("API 错误 401: unauthorized")),
+        ) as embed_mock:
+            client = EmbeddingClient(config)
+            with self.assertRaisesRegex(ValueError, "401"):
+                await client.embed_batch(["第一页"])
+
+        self.assertEqual(embed_mock.await_count, 1)
+        self.assertEqual(client._transport.max_retries, 0)
+
     async def test_reranker_client_delegates_transport_and_preserves_result_mapping(self) -> None:
         from src.core.manga_insight.config_models import RerankerConfig
         from src.core.manga_insight.reranker_client import RerankerClient
@@ -145,6 +281,9 @@ class MangaInsightSharedTransportTests(unittest.IsolatedAsyncioTestCase):
             model="rerank-model",
             base_url="https://example.com/v1",
             top_k=2,
+            transport_retries=6,
+            business_retries=1,
+            timeout_seconds=0,
         )
         documents = [
             {"document": "第一页摘要", "page_num": 1},
@@ -173,6 +312,72 @@ class MangaInsightSharedTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.query, "主角是谁")
         self.assertEqual(request.documents, ["第一页摘要", "第二页摘要"])
         self.assertEqual(request.top_n, 2)
+        self.assertIsNone(request.timeout)
+        self.assertEqual(client._transport.max_retries, 6)
+
+    async def test_reranker_client_retries_empty_business_result_only(self) -> None:
+        from src.core.manga_insight.config_models import RerankerConfig
+        from src.core.manga_insight.reranker_client import RerankerClient
+
+        config = RerankerConfig(
+            provider="custom",
+            api_key="test-key",
+            model="rerank-model",
+            base_url="https://example.com/v1",
+            top_k=2,
+            transport_retries=0,
+            business_retries=1,
+            timeout_seconds=0,
+        )
+        documents = [
+            {"document": "第一页摘要", "page_num": 1},
+            {"document": "第二页摘要", "page_num": 2},
+        ]
+
+        with mock.patch(
+            "src.core.manga_insight.reranker_client.AsyncOpenAICompatibleTransport.rerank",
+            new=mock.AsyncMock(
+                side_effect=[
+                    {"results": []},
+                    {"results": [{"index": 1, "relevance_score": 0.93}]},
+                ]
+            ),
+        ) as rerank_mock:
+            client = RerankerClient(config)
+            reranked = await client.rerank("主角是谁", documents, top_k=1)
+
+        self.assertEqual(rerank_mock.await_count, 2)
+        self.assertEqual([item["page_num"] for item in reranked], [2])
+
+    async def test_reranker_client_does_not_business_retry_non_retryable_value_error(self) -> None:
+        from src.core.manga_insight.config_models import RerankerConfig
+        from src.core.manga_insight.reranker_client import RerankerClient
+
+        config = RerankerConfig(
+            provider="custom",
+            api_key="test-key",
+            model="rerank-model",
+            base_url="https://example.com/v1",
+            top_k=2,
+            transport_retries=0,
+            business_retries=10,
+            timeout_seconds=0,
+        )
+        documents = [
+            {"document": "第一页摘要", "page_num": 1},
+            {"document": "第二页摘要", "page_num": 2},
+        ]
+
+        with mock.patch(
+            "src.core.manga_insight.reranker_client.AsyncOpenAICompatibleTransport.rerank",
+            new=mock.AsyncMock(side_effect=ValueError("API 错误 401: unauthorized")),
+        ) as rerank_mock:
+            client = RerankerClient(config)
+            reranked = await client.rerank("主角是谁", documents, top_k=2)
+
+        self.assertEqual(rerank_mock.await_count, 1)
+        self.assertEqual([item["page_num"] for item in reranked], [1, 2])
+        self.assertEqual(client._transport.max_retries, 0)
 
     async def test_vlm_client_uses_shared_async_transport_for_multimodal_chat(self) -> None:
         from src.core.manga_insight.config_models import PromptsConfig, VLMConfig

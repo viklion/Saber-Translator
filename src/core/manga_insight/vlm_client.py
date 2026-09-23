@@ -6,8 +6,7 @@ import asyncio
 import base64
 import io
 import logging
-import re
-from typing import List, Dict, Optional
+from typing import Callable, List, Dict, Optional
 
 from PIL import Image
 
@@ -16,6 +15,7 @@ from src.shared.openai_execution import (
     OpenAICompatibleAsyncExecutor,
     OpenAICompatibleBusinessRetryableError,
     build_openai_compatible_runtime_options,
+    extract_json_block_from_text,
 )
 from src.shared.openai_options import OpenAICompatibleOptions
 from src.shared.ai_providers import provider_requires_api_key
@@ -111,6 +111,45 @@ class VLMClient:
             parser=self._build_batch_analysis_parser(start_page, end_page),
         )
 
+    async def generate_messages(
+        self,
+        messages: List[Dict[str, object]],
+        *,
+        temperature: Optional[float] = None,
+        on_stream_chunk: Optional[Callable[[str], None]] = None,
+    ) -> str:
+        if not self._base_url:
+            raise ValueError(f"服务商 '{self.config.provider}' 需要设置 base_url")
+
+        options = OpenAICompatibleOptions.from_dict(self.config.openai_options.to_dict())
+        if temperature is not None:
+            options.request.temperature = temperature
+
+        def _handle_stream_chunk(delta: str, _full_text: str) -> None:
+            if on_stream_chunk and delta:
+                on_stream_chunk(delta)
+
+        result = await self._executor.execute(
+            UnifiedChatRequest(
+                provider=self.provider,
+                api_key=self.config.api_key,
+                model=self.config.model,
+                messages=messages,
+                base_url=self.config.base_url or None,
+                capability="vlm",
+                openai_options=options,
+                runtime_options=build_openai_compatible_runtime_options(
+                    timeout=self._timeout,
+                    print_stream_output=options.execution.use_stream,
+                    stream_output_label="角色工坊聊天",
+                    on_stream_chunk=_handle_stream_chunk,
+                ),
+            ),
+            capability="vlm",
+            logger_instance=logger,
+        )
+        return str(result.parsed)
+
     def _build_batch_analysis_prompt(self, start_page: int, end_page: int, page_count: int, context: Dict = None) -> str:
         base_prompt = self.prompts_config.batch_analysis if self.prompts_config.batch_analysis else DEFAULT_BATCH_ANALYSIS_PROMPT
         prompt = base_prompt.replace("{page_count}", str(page_count))
@@ -118,7 +157,7 @@ class VLMClient:
         prompt = prompt.replace("{end_page}", str(end_page))
 
         if context and context.get("previous_summary"):
-            batch_count = context.get("context_batch_count", 1)
+            batch_count = context.get("context_batch_count", 3)
             if batch_count > 1:
                 prompt += f"\n\n【前文概要（前{batch_count}批内容）】\n请参考以下前文信息，确保剧情连贯：\n{context['previous_summary']}"
             else:
@@ -182,89 +221,16 @@ class VLMClient:
         )
         return result.parsed
 
-    def _clean_thinking_tags(self, text: str) -> str:
-        patterns = [
-            r'<think>.*?</think>',
-            r'<thinking>.*?</thinking>',
-            r'<reasoning>.*?</reasoning>',
-            r'<thought>.*?</thought>',
-            r'<reflection>.*?</reflection>',
-            r'<内心独白>.*?</内心独白>',
-        ]
-        for pattern in patterns:
-            text = re.sub(pattern, '', text, flags=re.DOTALL | re.IGNORECASE)
-        return text.strip()
-
     def _extract_json_from_text(self, text: str) -> str:
-        text = self._clean_thinking_tags(text)
-        text = text.strip()
-
-        if text.startswith("```json"):
-            text = text[7:]
-        if text.startswith("```"):
-            text = text[3:]
-        if text.endswith("```"):
-            text = text[:-3]
-
-        text = text.strip()
-
-        if not text.startswith('{') and not text.startswith('['):
-            json_start = -1
-            for i, char in enumerate(text):
-                if char in '{[':
-                    json_start = i
-                    break
-            if json_start >= 0:
-                text = text[json_start:]
-
-        text = self._find_complete_json(text)
-        return text
-
-    def _find_complete_json(self, text: str) -> str:
-        if not text:
-            return text
-
-        open_char = text[0] if text else ''
-        if open_char == '{':
-            close_char = '}'
-        elif open_char == '[':
-            close_char = ']'
-        else:
-            return text
-
-        depth = 0
-        in_string = False
-        escape = False
-
-        for i, char in enumerate(text):
-            if escape:
-                escape = False
-                continue
-
-            if char == '\\':
-                escape = True
-                continue
-
-            if char == '"':
-                in_string = not in_string
-                continue
-
-            if in_string:
-                continue
-
-            if char == open_char:
-                depth += 1
-            elif char == close_char:
-                depth -= 1
-                if depth == 0:
-                    return text[:i + 1]
-
-        return text
+        return extract_json_block_from_text(text)
 
     def _parse_batch_analysis(self, response_text: str, start_page: int, end_page: int) -> Dict:
-        text = self._extract_json_from_text(response_text)
-
-        result = parse_llm_json(text)
+        try:
+            text = self._extract_json_from_text(response_text)
+            result = parse_llm_json(text)
+        except OpenAICompatibleBusinessRetryableError as exc:
+            logger.warning(f"批量 JSON 提取失败，第{start_page}-{end_page}页: {exc}")
+            result = {}
 
         if not result:
             logger.warning(f"批量 JSON 解析失败，第{start_page}-{end_page}页")

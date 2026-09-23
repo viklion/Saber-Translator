@@ -1,7 +1,7 @@
 """
 Manga Insight 生图客户端。
 
-当前版本仅保留一个明确支持的生图网关：gpt2api。
+当前版本支持 OpenAI 兼容图片接口网关。
 调用策略：
 - 无参考图：POST /v1/images/generations
 - 有任意参考图：POST /v1/images/edits
@@ -25,8 +25,14 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import httpx
 from PIL import Image, ImageDraw, ImageFont
 
+from src.shared.ai_transport import RETRYABLE_EXCEPTIONS, RETRYABLE_STATUS_CODES
 from src.shared.http_config import build_httpx_kwargs
-from src.shared.ai_providers import IMAGE_GEN_CAPABILITY, normalize_provider_id, provider_supports_capability
+from src.shared.ai_providers import (
+    IMAGE_GEN_CAPABILITY,
+    normalize_provider_id,
+    provider_requires_model,
+    provider_supports_capability,
+)
 
 from ..config_models import ImageGenConfig
 from .base_client import BaseAPIClient
@@ -35,6 +41,12 @@ from .provider_registry import get_image_gen_base_url
 logger = logging.getLogger("MangaInsight.ImageGenClient")
 
 _DOWNLOAD_TIMEOUT_SECONDS = 60
+DEFAULT_IMAGE_GEN_TRANSPORT_RETRIES = 10
+DEFAULT_IMAGE_GEN_BUSINESS_RETRIES = 10
+
+
+class ImageGenBusinessRetryableError(ValueError):
+    """仅用于生图结果级别的可重试错误。"""
 
 
 class ImageGenAdapter(Protocol):
@@ -47,7 +59,7 @@ class ImageGenAdapter(Protocol):
         ...
 
 
-class GPT2ApiImageGenAdapter:
+class OpenAICompatibleImageGenAdapter:
     async def generate(
         self,
         client: "ImageGenClient",
@@ -55,60 +67,33 @@ class GPT2ApiImageGenAdapter:
         prepared_refs: List[Dict[str, object]],
     ) -> bytes:
         request_url = client._build_api_url("images/edits" if prepared_refs else "images/generations")
-
-        for retry in range(client.config.max_retries):
-            try:
-                if prepared_refs:
-                    response = await client.client.post(
-                        request_url,
-                        headers=client._build_multipart_headers(),
-                        data=client._build_edit_form_data(prompt),
-                        files=client._build_edit_files(prepared_refs),
-                    )
-                else:
-                    response = await client.client.post(
-                        request_url,
-                        headers=client._get_headers(),
-                        json=client._build_generation_body(prompt),
-                    )
-                payload = client._decode_response_payload(response)
-                client._raise_api_error_if_needed(response, payload)
-
-                if client._payload_has_result(payload):
-                    return await client._extract_image_bytes_from_payload(payload)
-
-                raise ValueError("gpt2api 返回中没有图片结果")
-            except Exception as exc:
-                logger.warning(
-                    "gpt2api 生图调用失败 (尝试 %s/%s): %s",
-                    retry + 1,
-                    client.config.max_retries,
-                    exc,
-                )
-                if retry < client.config.max_retries - 1:
-                    await asyncio.sleep(2 ** retry)
-                else:
-                    raise
+        return await client._request_image_bytes(request_url, prompt, prepared_refs)
 
 
 IMAGE_GEN_ADAPTERS: Dict[str, ImageGenAdapter] = {
-    "gpt2api": GPT2ApiImageGenAdapter(),
+    "gpt2api": OpenAICompatibleImageGenAdapter(),
+    "newapi": OpenAICompatibleImageGenAdapter(),
 }
 
 
 class ImageGenClient(BaseAPIClient):
-    """专门适配 gpt2api 的生图客户端。"""
+    """OpenAI 兼容图片接口客户端。"""
 
     def __init__(self, config: ImageGenConfig):
         self.config = config
         resolved_base_url = config.base_url or get_image_gen_base_url(config.provider)
+        timeout_value = float(config.timeout_seconds or 0)
+        self._timeout = None if timeout_value <= 0 else timeout_value
+        transport_retries = config.transport_retries if config.transport_retries is not None else DEFAULT_IMAGE_GEN_TRANSPORT_RETRIES
+        business_retries = config.business_retries if config.business_retries is not None else DEFAULT_IMAGE_GEN_BUSINESS_RETRIES
+        self._transport_retries = max(0, int(transport_retries))
+        self._business_retries = max(0, int(business_retries))
         super().__init__(
             provider=config.provider,
             api_key=config.api_key,
             base_url=config.base_url,
             resolved_base_url=resolved_base_url,
-            timeout=300.0,
-            max_retries=config.max_retries,
+            timeout=self._timeout,
         )
         logger.info("ImageGenClient 初始化: provider=%s, base_url=%s", config.provider, self._base_url)
 
@@ -125,9 +110,102 @@ class ImageGenClient(BaseAPIClient):
             raise ValueError(f"服务商 '{self.config.provider}' 尚未注册生图适配器")
         if not self.base_url:
             raise ValueError(f"{self.config.provider} 生图服务商需要设置 base_url")
+        if provider_requires_model(provider) and not str(self.config.model or "").strip():
+            raise ValueError(f"{self.config.provider} 生图服务商需要设置 model")
 
         prepared_refs = self._prepare_reference_images(reference_images)
         return await adapter.generate(self, prompt, prepared_refs)
+
+    async def _request_image_bytes(
+        self,
+        request_url: str,
+        prompt: str,
+        prepared_refs: List[Dict[str, object]],
+    ) -> bytes:
+        last_error: Optional[Exception] = None
+        total_attempts = self._business_retries + 1
+
+        for attempt in range(total_attempts):
+            try:
+                payload = await self._request_generation_payload(request_url, prompt, prepared_refs)
+                if not self._payload_has_result(payload):
+                    raise ImageGenBusinessRetryableError(f"{self.config.provider} 返回中没有图片结果")
+                try:
+                    return await self._extract_image_bytes_from_payload(payload)
+                except ValueError as exc:
+                    raise ImageGenBusinessRetryableError(str(exc)) from exc
+            except ImageGenBusinessRetryableError as exc:
+                last_error = exc
+                if attempt >= total_attempts - 1:
+                    break
+                logger.warning(
+                    "%s 生图业务重试 %s/%s: %s",
+                    self.config.provider,
+                    attempt + 1,
+                    self._business_retries,
+                    exc,
+                )
+                await asyncio.sleep(1)
+
+        if last_error:
+            raise last_error
+        raise RuntimeError("生图响应为空")
+
+    async def _request_generation_payload(
+        self,
+        request_url: str,
+        prompt: str,
+        prepared_refs: List[Dict[str, object]],
+    ) -> Dict:
+        last_exception: Optional[Exception] = None
+
+        for attempt in range(self._transport_retries + 1):
+            try:
+                if prepared_refs:
+                    response = await self.client.post(
+                        request_url,
+                        headers=self._build_multipart_headers(),
+                        data=self._build_edit_form_data(prompt),
+                        files=self._build_edit_files(prepared_refs),
+                    )
+                else:
+                    response = await self.client.post(
+                        request_url,
+                        headers=self._get_headers(),
+                        json=self._build_generation_body(prompt),
+                    )
+
+                if response.status_code in RETRYABLE_STATUS_CODES and attempt < self._transport_retries:
+                    logger.warning(
+                        "%s 生图传输重试 %s/%s: HTTP %s",
+                        self.config.provider,
+                        attempt + 1,
+                        self._transport_retries,
+                        response.status_code,
+                    )
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+
+                payload = self._decode_response_payload(response)
+                self._raise_api_error_if_needed(response, payload)
+                return payload
+            except RETRYABLE_EXCEPTIONS as exc:
+                last_exception = exc
+                if attempt < self._transport_retries:
+                    logger.warning(
+                        "%s 生图传输重试 %s/%s: %s",
+                        self.config.provider,
+                        attempt + 1,
+                        self._transport_retries,
+                        type(exc).__name__,
+                    )
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                raise
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("生图传输重试耗尽")
 
     def _build_generation_body(self, prompt: str) -> Dict[str, object]:
         return {
@@ -301,7 +379,7 @@ class ImageGenClient(BaseAPIClient):
         if response.status_code >= 400:
             if error_message:
                 raise ValueError(error_message)
-            raise ValueError(f"gpt2api 请求失败: HTTP {response.status_code}")
+            raise ValueError(f"{self.config.provider} 请求失败: HTTP {response.status_code}")
         if error_message and not self._payload_has_result(payload):
             raise ValueError(error_message)
 
@@ -310,12 +388,12 @@ class ImageGenClient(BaseAPIClient):
             return response.json()
         except ValueError as exc:
             raw_excerpt = (response.text or "")[:300]
-            raise ValueError(f"gpt2api 返回了非 JSON 响应: {raw_excerpt}") from exc
+            raise ValueError(f"{self.config.provider} 返回了非 JSON 响应: {raw_excerpt}") from exc
 
     async def _extract_image_bytes_from_payload(self, payload: Dict) -> bytes:
         items = self._extract_result_items(payload)
         if not items:
-            raise ValueError("gpt2api 返回中没有图片数据")
+            raise ValueError(f"{self.config.provider} 返回中没有图片数据")
 
         image_item = items[0]
         if image_item.get("b64_json"):
@@ -323,7 +401,7 @@ class ImageGenClient(BaseAPIClient):
 
         image_url = str(image_item.get("url", "")).strip()
         if not image_url:
-            raise ValueError("gpt2api 返回的图片项缺少 url")
+            raise ValueError(f"{self.config.provider} 返回的图片项缺少 url")
         return await self._download_image_asset(image_url)
 
     async def _download_image_asset(self, asset_value: str) -> bytes:
@@ -343,4 +421,4 @@ class ImageGenClient(BaseAPIClient):
                 response.raise_for_status()
                 return response.content
 
-        raise ValueError(f"无法解析 gpt2api 图片资源: {asset_value[:120]}")
+        raise ValueError(f"无法解析 {self.config.provider} 图片资源: {asset_value[:120]}")

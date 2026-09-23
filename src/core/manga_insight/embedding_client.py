@@ -2,8 +2,9 @@
 Manga Insight Embedding / Chat clients backed by shared async transport.
 """
 
+import asyncio
 import logging
-from typing import List, Optional
+from typing import Any, Callable, List, Optional, TypeVar
 
 from src.shared.ai_transport import (
     AsyncOpenAICompatibleTransport,
@@ -13,6 +14,7 @@ from src.shared.ai_transport import (
 from src.shared.openai_execution import (
     OpenAICompatibleAsyncExecutor,
     build_openai_compatible_runtime_options,
+    parse_json_block_from_text,
 )
 from src.shared.openai_options import OpenAICompatibleOptions
 
@@ -21,7 +23,15 @@ from .clients.provider_registry import get_base_url
 from .config_models import EmbeddingConfig, ChatLLMConfig
 
 logger = logging.getLogger("MangaInsight.Embedding")
-DEFAULT_EMBEDDING_MAX_RETRIES = 3
+DEFAULT_EMBEDDING_MAX_RETRIES = 10
+DEFAULT_EMBEDDING_BUSINESS_RETRIES = 10
+T = TypeVar("T")
+
+
+class EmbeddingBusinessRetryableError(ValueError):
+    """仅用于 Embedding 结果级别的可重试错误。"""
+
+
 def _provider_id(value) -> str:
     if isinstance(value, str):
         return value.lower()
@@ -38,8 +48,14 @@ class EmbeddingClient:
         self.provider = _provider_id(config.provider)
         self._base_url = get_base_url(self.provider, config.base_url)
         self._rpm_limiter = RPMLimiter(config.rpm_limit, bucket_id=f"embedding:{self.provider}")
-        self._timeout = 60.0
-        self._transport = AsyncOpenAICompatibleTransport(max_retries=DEFAULT_EMBEDDING_MAX_RETRIES)
+        timeout_value = float(config.timeout_seconds or 0)
+        self._timeout = None if timeout_value <= 0 else timeout_value
+        transport_retries = config.transport_retries if config.transport_retries is not None else DEFAULT_EMBEDDING_MAX_RETRIES
+        business_retries = config.business_retries if config.business_retries is not None else DEFAULT_EMBEDDING_BUSINESS_RETRIES
+        self._transport = AsyncOpenAICompatibleTransport(
+            max_retries=max(0, int(transport_retries))
+        )
+        self._business_retries = max(0, int(business_retries))
 
         logger.info(f"EmbeddingClient 初始化: provider={config.provider}, base_url={self._base_url}")
 
@@ -70,17 +86,48 @@ class EmbeddingClient:
         if not self._base_url:
             raise ValueError(f"服务商 '{self.config.provider}' 需要设置 base_url")
 
-        await self._enforce_rpm_limit()
-        return await self._transport.embed(
-            UnifiedEmbeddingRequest(
-                provider=self.provider,
-                api_key=self.config.api_key,
-                model=self.config.model,
-                inputs=texts,
-                base_url=self.config.base_url or None,
-                timeout=self._timeout,
+        last_error: Optional[Exception] = None
+        total_attempts = self._business_retries + 1
+
+        for attempt in range(total_attempts):
+            await self._enforce_rpm_limit()
+            try:
+                embeddings = await self._transport.embed(
+                    UnifiedEmbeddingRequest(
+                        provider=self.provider,
+                        api_key=self.config.api_key,
+                        model=self.config.model,
+                        inputs=texts,
+                        base_url=self.config.base_url or None,
+                        timeout=self._timeout,
+                    )
+                )
+                self._validate_embeddings_result(texts, embeddings)
+                return embeddings
+            except EmbeddingBusinessRetryableError as exc:
+                last_error = exc
+                if attempt >= total_attempts - 1:
+                    break
+                logger.warning(
+                    "Embedding 业务重试 %s/%s: %s",
+                    attempt + 1,
+                    self._business_retries,
+                    exc,
+                )
+                await asyncio.sleep(1)
+
+        if last_error:
+            raise last_error
+        return []
+
+    @staticmethod
+    def _validate_embeddings_result(texts: List[str], embeddings: List[List[float]]) -> None:
+        if len(embeddings) != len(texts):
+            raise EmbeddingBusinessRetryableError(
+                f"Embedding 返回数量不匹配: 期望 {len(texts)}，实际 {len(embeddings)}"
             )
-        )
+        if any(not isinstance(item, list) or len(item) == 0 for item in embeddings):
+            raise EmbeddingBusinessRetryableError("Embedding 响应包含空向量")
 
     async def test_connection(self) -> bool:
         try:
@@ -122,25 +169,33 @@ class ChatClient:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         await self.close()
 
-    async def generate(
+    def _build_messages(self, prompt: str, system: Optional[str] = None) -> List[dict[str, str]]:
+        messages: List[dict[str, str]] = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        return messages
+
+    def _build_options(self, temperature: Optional[float] = None) -> OpenAICompatibleOptions:
+        options = OpenAICompatibleOptions.from_dict(self.config.openai_options.to_dict())
+        if temperature is not None:
+            options.request.temperature = temperature
+        return options
+
+    async def _execute_request(
         self,
         prompt: str,
+        *,
         system: Optional[str] = None,
-        temperature: Optional[float] = None
-    ) -> str:
+        temperature: Optional[float] = None,
+        parser: Optional[Callable[[str], T]] = None,
+    ) -> T | str:
         logger.debug(f"[ChatClient] provider={self.config.provider}, base_url={self._base_url}, model={self.config.model}")
 
         if not self._base_url:
             raise ValueError(f"服务商 '{self.config.provider}' 需要设置 base_url")
 
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        options = OpenAICompatibleOptions.from_dict(self.config.openai_options.to_dict())
-        if temperature is not None:
-            options.request.temperature = temperature
+        options = self._build_options(temperature)
         use_stream = options.execution.use_stream
         logger.debug(f"[ChatClient] use_stream={use_stream}, config_type={type(self.config).__name__}")
 
@@ -149,7 +204,7 @@ class ChatClient:
                 provider=self.provider,
                 api_key=self.config.api_key,
                 model=self.config.model,
-                messages=messages,
+                messages=self._build_messages(prompt, system),
                 base_url=getattr(self.config, "base_url", None) or None,
                 capability="chat",
                 openai_options=options,
@@ -160,9 +215,53 @@ class ChatClient:
                 ),
             ),
             capability="chat",
+            parser=parser,
             logger_instance=logger,
         )
-        return str(result.parsed)
+        return result.parsed
+
+    async def generate(
+        self,
+        prompt: str,
+        system: Optional[str] = None,
+        temperature: Optional[float] = None
+    ) -> str:
+        result = await self._execute_request(
+            prompt,
+            system=system,
+            temperature=temperature,
+        )
+        return str(result)
+
+    async def generate_parsed(
+        self,
+        prompt: str,
+        *,
+        parser: Callable[[str], T],
+        system: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> T:
+        result = await self._execute_request(
+            prompt,
+            system=system,
+            temperature=temperature,
+            parser=parser,
+        )
+        return result  # type: ignore[return-value]
+
+    async def generate_json(
+        self,
+        prompt: str,
+        *,
+        system: Optional[str] = None,
+        temperature: Optional[float] = None,
+    ) -> Any:
+        return await self.generate_parsed(
+            prompt,
+            parser=parse_json_block_from_text,
+            system=system,
+            temperature=temperature,
+        )
 
     async def test_connection(self) -> bool:
         try:

@@ -303,7 +303,7 @@ if __name__ == '__main__':
         pass  # loguru不是必需的库
     
     # 打开浏览器
-    threading.Timer(1, open_browser).start()
+    # threading.Timer(1, open_browser).start()
     
     # 启动Sakura服务监控线程
     from src.app.api.system.tests import start_service_monitor

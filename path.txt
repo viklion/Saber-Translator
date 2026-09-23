@@ -1,0 +1,5 @@
+路径映射
+/app/data
+/app/config
+/app/logs
+/app/models
